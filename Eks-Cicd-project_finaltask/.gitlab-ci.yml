@@ -1,0 +1,309 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline" && $PATHNEX_TEARDOWN == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+stages: [test, build, plan, review, apply, deploy, monitoring, expose, destroy_plan, destroy]
+
+variables:
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER_NAME: pathnex-gitlab-staging
+  PATHNEX_NAMESPACE: pathnex
+  PATHNEX_MONITORING_NAMESPACE: pathnex-monitoring
+  PATHNEX_GRAFANA_NODE_PORT: "30080"
+  PATHNEX_APP_NODE_PORT: "30081"
+
+pathnex:test:
+  stage: test
+  image: python:3.13-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "parent_pipeline"'
+  script:
+    - python -m unittest discover -s pathnex -v
+
+pathnex:build:
+  stage: build
+  image:
+    name: moby/buildkit:rootless
+    entrypoint: [""]
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "parent_pipeline" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - mkdir -p ~/.docker
+    - umask 077
+    - auth=$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
+    - printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$auth" > ~/.docker/config.json
+    - buildctl-daemonless.sh build --frontend dockerfile.v0 --local context=pathnex --local dockerfile=pathnex --output "type=image,name=$CI_REGISTRY_IMAGE/pathnex:$CI_COMMIT_SHA,push=true" --metadata-file build-metadata.json
+  artifacts:
+    paths: [build-metadata.json]
+    expire_in: 3 days
+
+.pathnex_aws:
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    - &aws_oidc |
+      set -eu
+      : "${AWS_ROLE_ARN:?Set AWS_ROLE_ARN in GitLab CI/CD variables}"
+      unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+      umask 077
+      export AWS_WEB_IDENTITY_TOKEN_FILE="$(mktemp)"
+      trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
+      printf '%s' "$GITLAB_OIDC_TOKEN" > "$AWS_WEB_IDENTITY_TOKEN_FILE"
+      export AWS_ROLE_SESSION_NAME="pathnex-${CI_PIPELINE_ID}"
+
+pathnex:aws_identity:
+  extends: .pathnex_aws
+  stage: test
+  image:
+    name: public.ecr.aws/aws-cli/aws-cli:latest
+    entrypoint: [""]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "parent_pipeline" && $CI_COMMIT_BRANCH == "main"'
+      when: manual
+      allow_failure: true
+  script:
+    - aws sts get-caller-identity
+
+.pathnex_terraform:
+  extends: .pathnex_aws
+  image:
+    name: hashicorp/terraform:1.13.5
+    entrypoint: [""]
+  variables:
+    TF_IN_AUTOMATION: "true"
+    TF_INPUT: "false"
+    TF_VAR_aws_region: "$AWS_REGION"
+    TF_VAR_cluster_name: "$EKS_CLUSTER_NAME"
+  before_script:
+    - *aws_oidc
+    - &terraform_init |
+      : "${TF_STATE_BUCKET:?Set TF_STATE_BUCKET to the existing private S3 bucket}"
+      terraform init -input=false \
+        -backend-config="bucket=$TF_STATE_BUCKET" \
+        -backend-config="region=${TF_STATE_REGION:-$AWS_REGION}" \
+        -backend-config="key=pathnex/staging/terraform.tfstate"
+
+pathnex:terraform_plan:
+  extends: .pathnex_terraform
+  stage: plan
+  rules: &staging_rules
+    - if: '$CI_PIPELINE_SOURCE != "parent_pipeline" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+  script:
+    - terraform validate
+    - sh ci/pathnex-terraform-plan.sh
+  artifacts:
+    access: maintainer
+    paths: [pathnex.tfplan, .terraform.lock.hcl, pathnex-plan-result, pathnex-terraform-review.yml]
+    expire_in: 3 days
+
+pathnex:terraform_review:
+  stage: review
+  rules: *staging_rules
+  needs: ["pathnex:terraform_plan"]
+  trigger:
+    include:
+      - artifact: pathnex-terraform-review.yml
+        job: pathnex:terraform_plan
+    strategy: mirror
+
+pathnex:terraform_finalize:
+  extends: .pathnex_terraform
+  stage: apply
+  rules: *staging_rules
+  needs:
+    - job: pathnex:terraform_plan
+    - job: pathnex:terraform_review
+      artifacts: false
+  resource_group: pathnex-staging-mutations
+  before_script:
+    - |
+      case "$(cat pathnex-plan-result)" in
+        0) echo "No infrastructure changes. Skipping terraform apply."; exit 0 ;;
+        2) ;;
+        *) echo "Missing or invalid Terraform plan result." >&2; exit 1 ;;
+      esac
+    - *aws_oidc
+    - *terraform_init
+  script:
+    - ': "${PATHNEX_REGISTRY_USER:?Set PATHNEX_REGISTRY_USER}"'
+    - ': "${PATHNEX_REGISTRY_TOKEN:?Set PATHNEX_REGISTRY_TOKEN}"'
+    - terraform apply -lock-timeout=5m pathnex.tfplan
+
+.pathnex_eks:
+  extends: .pathnex_aws
+  image: alpine:3.23
+  rules: *staging_rules
+  before_script:
+    - *aws_oidc
+    - apk add --no-cache aws-cli kubectl helm jq
+    - |
+      export KUBECONFIG="$(mktemp)"
+      trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE" "$KUBECONFIG"' EXIT
+      aws eks wait cluster-active --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+      aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION" --kubeconfig "$KUBECONFIG"
+
+pathnex:deploy_staging:
+  extends: .pathnex_eks
+  stage: deploy
+  needs:
+    - job: pathnex:build
+    - job: pathnex:terraform_finalize
+      artifacts: false
+  resource_group: pathnex-staging-mutations
+  environment: staging
+  script:
+    - |
+      : "${PATHNEX_REGISTRY_USER:?Set PATHNEX_REGISTRY_USER to the deploy token username}"
+      : "${PATHNEX_REGISTRY_TOKEN:?Set PATHNEX_REGISTRY_TOKEN to the deploy token value}"
+      apk add --no-cache skopeo
+      digest=$(jq -er '.["containerimage.digest"] | select(test("^sha256:[0-9a-f]{64}$"))' build-metadata.json)
+      image="$CI_REGISTRY_IMAGE/pathnex@$digest"
+      registry_auth_file="$(mktemp)"
+      trap 'rm -f "$AWS_WEB_IDENTITY_TOKEN_FILE" "$KUBECONFIG" "$registry_auth_file"' EXIT
+      auth=$(printf '%s:%s' "$PATHNEX_REGISTRY_USER" "$PATHNEX_REGISTRY_TOKEN" | base64 | tr -d '\n')
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$auth" > "$registry_auth_file"
+      if ! skopeo inspect --raw --authfile "$registry_auth_file" "docker://$image" > /dev/null; then
+        echo "Unable to read the image manifest. For 401 or 403, check the deploy token username, value, expiration, and read_registry scope." >&2
+        exit 1
+      fi
+
+      kubectl create namespace "$PATHNEX_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+      kubectl -n "$PATHNEX_NAMESPACE" create secret generic gitlab-registry \
+        --type=kubernetes.io/dockerconfigjson --from-file=".dockerconfigjson=$registry_auth_file" \
+        --dry-run=client -o yaml | kubectl apply --server-side -f -
+      helm lint deploy/pathnex
+      if helm upgrade --install pathnex deploy/pathnex --namespace "$PATHNEX_NAMESPACE" \
+        --set-string "image.reference=$image" \
+        --set-string "version=$CI_COMMIT_SHA" \
+        --set "service.nodePort=$PATHNEX_APP_NODE_PORT" \
+        --set-string 'imagePullSecrets[0].name=gitlab-registry' --atomic --timeout 5m; then
+        kubectl -n "$PATHNEX_NAMESPACE" get pods -l app.kubernetes.io/instance=pathnex
+      else
+        kubectl -n "$PATHNEX_NAMESPACE" get events --sort-by=.metadata.creationTimestamp || true
+        exit 1
+      fi
+
+pathnex:deploy_monitoring:
+  extends: .pathnex_eks
+  stage: monitoring
+  needs: ["pathnex:deploy_staging"]
+  resource_group: pathnex-staging-mutations
+  script:
+    - |
+      helm upgrade --install pathnex-monitoring \
+        oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack --version 93.8.0 \
+        --namespace "$PATHNEX_MONITORING_NAMESPACE" --create-namespace \
+        -f deploy/monitoring/values.yaml --atomic --timeout 10m
+      kubectl -n "$PATHNEX_MONITORING_NAMESPACE" get pods
+
+pathnex:expose_pathnex:
+  extends: .pathnex_eks
+  stage: expose
+  needs: ["pathnex:deploy_staging"]
+  resource_group: pathnex-staging-mutations
+  script:
+    - |
+      port=$(kubectl -n "$PATHNEX_NAMESPACE" get service pathnex -o jsonpath='{.spec.ports[0].nodePort}')
+      test "$port" = "$PATHNEX_APP_NODE_PORT"
+      sh ci/pathnex-allow-nodeport.sh API "$port" "${PATHNEX_APP_SOURCE_CIDR:-}"
+      kubectl get nodes -o wide
+      printf 'Pathnex URL: http://<reachable-node-ip>:%s/\n' "$port"
+
+pathnex:expose_grafana:
+  extends: .pathnex_eks
+  stage: expose
+  needs: ["pathnex:deploy_monitoring"]
+  resource_group: pathnex-staging-mutations
+  script:
+    - |
+      grafana_service=$(kubectl -n "$PATHNEX_MONITORING_NAMESPACE" get service pathnex-monitoring-grafana -o json)
+      printf '%s\n' "$grafana_service" |
+        jq -e --argjson node_port "$PATHNEX_GRAFANA_NODE_PORT" '
+          select((.spec.selector | length) > 0)
+          | {
+              apiVersion: "v1",
+              kind: "Service",
+              metadata: {name: "pathnex-grafana-nodeport"},
+              spec: {
+                type: "NodePort",
+                selector: .spec.selector,
+                ports: [(.spec.ports[0] | {name, port, targetPort, protocol} + {nodePort: $node_port})]
+              }
+            }' |
+        kubectl -n "$PATHNEX_MONITORING_NAMESPACE" apply -f -
+      sh ci/pathnex-allow-nodeport.sh Grafana "$PATHNEX_GRAFANA_NODE_PORT" "${PATHNEX_GRAFANA_SOURCE_CIDR:-}"
+      kubectl -n "$PATHNEX_MONITORING_NAMESPACE" get service pathnex-grafana-nodeport
+      kubectl get nodes -o wide
+      printf 'Grafana URL: http://<reachable-node-ip>:%s\n' "$PATHNEX_GRAFANA_NODE_PORT"
+
+pathnex:destroy_lab:
+  stage: destroy
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "parent_pipeline" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+      allow_failure: true
+  variables:
+    PATHNEX_TEARDOWN: "true"
+  resource_group: pathnex-staging-mutations
+  trigger:
+    include:
+      - local: .gitlab-ci.yml
+    strategy: mirror
+
+pathnex:terraform_destroy_plan:
+  extends: .pathnex_terraform
+  stage: destroy_plan
+  rules: &destroy_rules
+    - if: '$CI_PIPELINE_SOURCE == "parent_pipeline" && $PATHNEX_TEARDOWN == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+  script:
+    - |
+      state_resources=$(terraform state list)
+      if printf '%s\n' "$state_resources" | grep -qx 'aws_eks_cluster.pathnex'; then
+        cluster_resource=$(terraform state list -id="$EKS_CLUSTER_NAME" aws_eks_cluster.pathnex)
+        if [ "$cluster_resource" != "aws_eks_cluster.pathnex" ]; then
+          echo "The EKS cluster in the selected state does not match EKS_CLUSTER_NAME." >&2
+          exit 1
+        fi
+        printf '%s\n' "$EKS_CLUSTER_NAME" > pathnex-destroy-cluster
+      else
+        touch pathnex-destroy-cluster
+      fi
+      terraform plan -destroy -lock-timeout=5m -out=pathnex-destroy.tfplan
+  artifacts:
+    access: maintainer
+    paths: [pathnex-destroy.tfplan, pathnex-destroy-cluster, .terraform.lock.hcl]
+    expire_in: 1 day
+
+pathnex:prepare_destroy:
+  extends: .pathnex_aws
+  image: alpine:3.23
+  stage: destroy
+  rules: *destroy_rules
+  needs: ["pathnex:terraform_destroy_plan"]
+  script:
+    - |
+      if [ ! -s pathnex-destroy-cluster ]; then
+        echo "No EKS cluster is tracked in this Terraform state. Skipping Kubernetes cleanup."
+        exit 0
+      fi
+      test "$(cat pathnex-destroy-cluster)" = "$EKS_CLUSTER_NAME"
+      apk add --no-cache aws-cli kubectl helm jq
+      sh ci/pathnex-prepare-destroy.sh
+
+pathnex:terraform_destroy:
+  extends: .pathnex_terraform
+  stage: destroy
+  rules: *destroy_rules
+  needs:
+    - job: pathnex:terraform_destroy_plan
+    - job: pathnex:prepare_destroy
+      artifacts: false
+  script:
+    - terraform apply -lock-timeout=5m pathnex-destroy.tfplan
