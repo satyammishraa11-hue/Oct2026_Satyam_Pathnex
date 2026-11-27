@@ -1,0 +1,3 @@
+aws_region   = "ap-south-1"
+cluster_name = "pathnex-gitlab-staging"
+#pathnex-tf-backup-nov

@@ -1,0 +1,7 @@
+replicas: 2
+image:
+  reference: pathnex:local
+version: local
+imagePullSecrets: []
+service:
+  nodePort: 30081
